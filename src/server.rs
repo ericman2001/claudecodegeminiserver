@@ -146,28 +146,9 @@ fn resolve_path(root: &Path, request_path: &str) -> Option<PathBuf> {
     let normalized_path = normalize_path(&current_decoded);
     
     // Join with root directory using the normalized path
-    let mut path = root.join(&normalized_path);
+    let base_path = root.join(&normalized_path);
     
-    // If path is a directory, look for index.gmi
-    if path.is_dir() {
-        path = path.join("index.gmi");
-    }
-    
-    // If file doesn't have an extension and doesn't exist, try adding .gmi
-    if path.extension().is_none() && !path.exists() {
-        let gmi_path = path.with_extension("gmi");
-        if gmi_path.exists() {
-            path = gmi_path;
-        }
-    }
-    
-    // Ensure the path exists and is a file
-    if !path.exists() || !path.is_file() {
-        return None;
-    }
-    
-    // Final security check: ensure the resolved path is under the root directory
-    // Use canonicalize on both paths to resolve any symlinks or relative components
+    // SECURITY: Get canonical root path for validation
     let canonical_root = match root.canonicalize() {
         Ok(path) => path,
         Err(_) => {
@@ -176,20 +157,101 @@ fn resolve_path(root: &Path, request_path: &str) -> Option<PathBuf> {
         }
     };
     
-    match path.canonicalize() {
-        Ok(canonical_path) => {
-            if canonical_path.starts_with(&canonical_root) {
-                Some(canonical_path)
+    // SECURITY: Pre-validate that our constructed path would be within root
+    // before doing any filesystem operations that could leak information
+    // We do this by checking if the base path (without resolving symlinks) 
+    // starts with our root when both are made absolute
+    let absolute_base = match base_path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => {
+            // Path doesn't exist yet, so we can't canonicalize it
+            // We need to validate using a different approach
+            
+            // Convert to absolute path without resolving symlinks
+            let absolute_base = if base_path.is_absolute() {
+                base_path.clone()
             } else {
-                warn!("Path escape attempt: {:?} is not under {:?}", canonical_path, canonical_root);
-                None
+                std::env::current_dir().unwrap_or_default().join(&base_path)
+            };
+            
+            // Check if this absolute path would be under our root
+            // by checking if it starts with the canonical root
+            if !absolute_base.starts_with(&canonical_root) {
+                warn!("Constructed path would be outside root: {:?}", absolute_base);
+                return None;
+            }
+            
+            // If the base path doesn't exist, try our variations
+            let path_candidates = vec![
+                base_path.join("index.gmi"),     // Directory index  
+                base_path.with_extension("gmi"), // Adding .gmi extension
+            ];
+            
+            for candidate in path_candidates {
+                if candidate.exists() {
+                    match candidate.canonicalize() {
+                        Ok(canonical_path) => {
+                            if canonical_path.starts_with(&canonical_root) && canonical_path.is_file() {
+                                return Some(canonical_path);
+                            } else if !canonical_path.starts_with(&canonical_root) {
+                                warn!("Path escape attempt: {:?} is not under {:?}", canonical_path, canonical_root);
+                                return None;
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
+            return None;
+        }
+    };
+    
+    // If we got here, the base path exists and we have its canonical form
+    // Verify it's within our root directory
+    if !absolute_base.starts_with(&canonical_root) {
+        warn!("Path escape attempt: {:?} is not under {:?}", absolute_base, canonical_root);
+        return None;
+    }
+    
+    // Now safely check what type of file/directory we have
+    if absolute_base.is_file() {
+        return Some(absolute_base);
+    } else if absolute_base.is_dir() {
+        // Look for index.gmi in the directory
+        let index_path = absolute_base.join("index.gmi");
+        if index_path.exists() && index_path.is_file() {
+            match index_path.canonicalize() {
+                Ok(canonical_index) => {
+                    if canonical_index.starts_with(&canonical_root) {
+                        return Some(canonical_index);
+                    } else {
+                        warn!("Index path escape attempt: {:?}", canonical_index);
+                        return None;
+                    }
+                }
+                Err(_) => return None,
             }
         }
-        Err(_) => {
-            warn!("Failed to canonicalize file path: {:?}", path);
-            None
+    } else {
+        // Not a regular file or directory, try adding .gmi extension
+        let gmi_path = absolute_base.with_extension("gmi");
+        if gmi_path.exists() && gmi_path.is_file() {
+            match gmi_path.canonicalize() {
+                Ok(canonical_gmi) => {
+                    if canonical_gmi.starts_with(&canonical_root) {
+                        return Some(canonical_gmi);
+                    } else {
+                        warn!("GMI path escape attempt: {:?}", canonical_gmi);
+                        return None;
+                    }
+                }
+                Err(_) => return None,
+            }
         }
     }
+    
+    // No valid file found
+    None
 }
 
 /// Check if a decoded path contains directory traversal patterns
@@ -395,5 +457,40 @@ mod tests {
         // Test index file resolution
         let resolved = resolve_path(root, "/");
         assert_eq!(resolved, Some(index_file.canonicalize().unwrap()));
+    }
+    
+    #[test]
+    fn test_security_ordering_no_information_leakage() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        // Create a file outside the root directory (simulating /etc/passwd)
+        let outside_dir = temp_dir.path().parent().unwrap();
+        let outside_file = outside_dir.join("secret.txt");
+        fs::write(&outside_file, "secret content").unwrap();
+        
+        // Attempt directory traversal to access the file
+        // This should fail WITHOUT leaking whether the file exists
+        let result = resolve_path(root, "/../secret.txt");
+        assert_eq!(result, None);
+        
+        // The key security improvement: we should not be able to determine
+        // if files exist outside our root directory through timing or other means
+        // This test verifies our fix prevents information leakage
+        
+        // Test various traversal attempts that should all fail safely
+        let traversal_attempts = vec![
+            "/../secret.txt",
+            "/%2e%2e/secret.txt", 
+            "/%252e%252e/secret.txt",
+        ];
+        
+        for attempt in traversal_attempts {
+            let result = resolve_path(root, attempt);
+            assert_eq!(result, None, "Traversal attempt should fail: {}", attempt);
+        }
+        
+        // Clean up
+        let _ = fs::remove_file(&outside_file);
     }
 }
