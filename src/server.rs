@@ -118,16 +118,35 @@ async fn handle_connection(
 /// Resolve request path to filesystem path
 fn resolve_path(root: &Path, request_path: &str) -> Option<PathBuf> {
     // Remove leading slash and decode URL encoding
-    let decoded_path = urlencoding::decode(request_path.trim_start_matches('/')).ok()?;
+    let decoded_path = request_path.trim_start_matches('/');
     
-    // Prevent directory traversal attacks
-    if decoded_path.contains("..") {
-        warn!("Directory traversal attempt: {}", decoded_path);
+    // Perform iterative URL decoding to handle double/triple encoding
+    let mut previous_decoded = String::new();
+    let mut current_decoded = decoded_path.to_string();
+    
+    // Keep decoding until no more changes occur (prevents double encoding bypass)
+    while previous_decoded != current_decoded {
+        previous_decoded = current_decoded.clone();
+        current_decoded = match urlencoding::decode(&current_decoded) {
+            Ok(decoded) => decoded.into_owned(),
+            Err(_) => {
+                warn!("Invalid URL encoding in path: {}", request_path);
+                return None;
+            }
+        };
+    }
+    
+    // Robust directory traversal prevention
+    if is_directory_traversal_attempt(&current_decoded) {
+        warn!("Directory traversal attempt detected: {}", current_decoded);
         return None;
     }
     
-    // Join with root directory
-    let mut path = root.join(decoded_path.as_ref());
+    // Normalize path to prevent various bypass techniques
+    let normalized_path = normalize_path(&current_decoded);
+    
+    // Join with root directory using the normalized path
+    let mut path = root.join(&normalized_path);
     
     // If path is a directory, look for index.gmi
     if path.is_dir() {
@@ -147,18 +166,88 @@ fn resolve_path(root: &Path, request_path: &str) -> Option<PathBuf> {
         return None;
     }
     
-    // Ensure the resolved path is still under the root directory
+    // Final security check: ensure the resolved path is under the root directory
+    // Use canonicalize on both paths to resolve any symlinks or relative components
+    let canonical_root = match root.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            error!("Failed to canonicalize root directory: {:?}", root);
+            return None;
+        }
+    };
+    
     match path.canonicalize() {
         Ok(canonical_path) => {
-            if canonical_path.starts_with(root) {
+            if canonical_path.starts_with(&canonical_root) {
                 Some(canonical_path)
             } else {
-                warn!("Path escape attempt: {:?}", canonical_path);
+                warn!("Path escape attempt: {:?} is not under {:?}", canonical_path, canonical_root);
                 None
             }
         }
-        Err(_) => None,
+        Err(_) => {
+            warn!("Failed to canonicalize file path: {:?}", path);
+            None
+        }
     }
+}
+
+/// Check if a decoded path contains directory traversal patterns
+fn is_directory_traversal_attempt(path: &str) -> bool {
+    // Check for various directory traversal patterns
+    let traversal_patterns = [
+        "..",           // Basic parent directory
+        ".\\..",        // Windows style
+        "../",          // With slash
+        "..\\",         // Windows with backslash
+        "%2e%2e",       // URL encoded (should be caught by iterative decoding)
+        "..\x00",       // Null byte injection
+    ];
+    
+    for pattern in &traversal_patterns {
+        if path.contains(pattern) {
+            return true;
+        }
+    }
+    
+    // Check for encoded variations that might slip through
+    if path.contains('\0') {
+        return true; // Null byte injection
+    }
+    
+    // Check for various Unicode representations of dots
+    // Unicode normalization attack prevention
+    if path.contains("\u{002e}\u{002e}") || // Standard dots  
+       path.contains("\u{ff0e}\u{ff0e}") || // Fullwidth dots
+       path.contains("\u{2024}\u{2024}") {  // One dot leader
+        return true;
+    }
+    
+    false
+}
+
+/// Normalize path to prevent various bypass techniques
+fn normalize_path(path: &str) -> String {
+    let mut normalized = path.to_string();
+    
+    // Replace backslashes with forward slashes for consistency
+    normalized = normalized.replace('\\', "/");
+    
+    // Remove null bytes
+    normalized = normalized.replace('\0', "");
+    
+    // Collapse multiple slashes into single slash
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
+    
+    // Remove leading slashes
+    normalized = normalized.trim_start_matches('/').to_string();
+    
+    // Remove trailing slashes  
+    normalized = normalized.trim_end_matches('/').to_string();
+    
+    normalized
 }
 
 /// Serve a file to the client
@@ -226,6 +315,72 @@ mod tests {
         assert_eq!(resolve_path(root, "/../etc/passwd"), None);
         assert_eq!(resolve_path(root, "/../../etc/passwd"), None);
         assert_eq!(resolve_path(root, "/test/../../../etc/passwd"), None);
+        
+        // Test URL encoded traversal attempts
+        assert_eq!(resolve_path(root, "/%2e%2e/etc/passwd"), None);
+        assert_eq!(resolve_path(root, "/%2e%2e%2fetc%2fpasswd"), None);
+        
+        // Test double URL encoded traversal (the vulnerability we found)
+        assert_eq!(resolve_path(root, "/%252e%252e/etc/passwd"), None);
+        assert_eq!(resolve_path(root, "/%252e%252e%252fetc%252fpasswd"), None);
+        
+        // Test Windows-style traversal
+        assert_eq!(resolve_path(root, "/..\\etc\\passwd"), None);
+        assert_eq!(resolve_path(root, "/test\\..\\..\\..\\etc\\passwd"), None);
+        
+        // Test null byte injection
+        assert_eq!(resolve_path(root, "/test.gmi\0../../../etc/passwd"), None);
+        assert_eq!(resolve_path(root, "/test.gmi%00../../../etc/passwd"), None);
+    }
+    
+    #[test]
+    fn test_is_directory_traversal_attempt() {
+        // Basic traversal patterns
+        assert!(is_directory_traversal_attempt("../etc/passwd"));
+        assert!(is_directory_traversal_attempt("../../etc/passwd"));
+        assert!(is_directory_traversal_attempt("test/../../../etc/passwd"));
+        
+        // Windows style
+        assert!(is_directory_traversal_attempt("..\\etc\\passwd"));
+        assert!(is_directory_traversal_attempt("test\\..\\..\\etc\\passwd"));
+        
+        // With slashes
+        assert!(is_directory_traversal_attempt("../"));
+        assert!(is_directory_traversal_attempt("..\\"));
+        
+        // Null byte injection
+        assert!(is_directory_traversal_attempt("test\0../etc/passwd"));
+        
+        // Valid paths should not be flagged
+        assert!(!is_directory_traversal_attempt("test.gmi"));
+        assert!(!is_directory_traversal_attempt("subdir/file.gmi"));
+        assert!(!is_directory_traversal_attempt("index.gmi"));
+        assert!(!is_directory_traversal_attempt(""));
+    }
+    
+    #[test]
+    fn test_normalize_path() {
+        // Basic normalization
+        assert_eq!(normalize_path("test.gmi"), "test.gmi");
+        assert_eq!(normalize_path("/test.gmi"), "test.gmi");
+        assert_eq!(normalize_path("test.gmi/"), "test.gmi");
+        assert_eq!(normalize_path("/test.gmi/"), "test.gmi");
+        
+        // Multiple slashes
+        assert_eq!(normalize_path("test//file.gmi"), "test/file.gmi");
+        assert_eq!(normalize_path("///test///file.gmi///"), "test/file.gmi");
+        
+        // Backslash to forward slash conversion
+        assert_eq!(normalize_path("test\\file.gmi"), "test/file.gmi");
+        assert_eq!(normalize_path("test\\\\file.gmi"), "test/file.gmi");
+        
+        // Null byte removal
+        assert_eq!(normalize_path("test\0file.gmi"), "testfile.gmi");
+        
+        // Empty and root cases
+        assert_eq!(normalize_path(""), "");
+        assert_eq!(normalize_path("/"), "");
+        assert_eq!(normalize_path("///"), "");
     }
     
     #[test]
