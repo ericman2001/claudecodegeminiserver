@@ -19,9 +19,11 @@ The server is organized into modular components:
 
 Key architectural decisions:
 - Uses `tokio` for async I/O and `rustls` for TLS
-- Enforces security through path validation and size limits
+- Uses `rcgen` 0.14+ for secure TLS certificate generation
+- Enforces comprehensive security through robust path validation and size limits
 - Implements only essential Gemini status codes (20, 40, 51, 59)
 - Automatic index.gmi serving for directories
+- Defense-in-depth security approach with multiple validation layers
 
 ## Development Commands
 
@@ -40,6 +42,9 @@ cargo fmt
 
 # Run linter
 cargo clippy
+
+# Security audit for dependencies
+cargo audit
 
 # Generate and serve with self-signed cert
 cargo run -- --generate-cert
