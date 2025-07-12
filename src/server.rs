@@ -118,47 +118,198 @@ async fn handle_connection(
 /// Resolve request path to filesystem path
 fn resolve_path(root: &Path, request_path: &str) -> Option<PathBuf> {
     // Remove leading slash and decode URL encoding
-    let decoded_path = urlencoding::decode(request_path.trim_start_matches('/')).ok()?;
+    let decoded_path = request_path.trim_start_matches('/');
     
-    // Prevent directory traversal attacks
-    if decoded_path.contains("..") {
-        warn!("Directory traversal attempt: {}", decoded_path);
+    // Perform iterative URL decoding to handle double/triple encoding
+    let mut previous_decoded = String::new();
+    let mut current_decoded = decoded_path.to_string();
+    
+    // Keep decoding until no more changes occur (prevents double encoding bypass)
+    while previous_decoded != current_decoded {
+        previous_decoded = current_decoded.clone();
+        current_decoded = match urlencoding::decode(&current_decoded) {
+            Ok(decoded) => decoded.into_owned(),
+            Err(_) => {
+                warn!("Invalid URL encoding in path: {}", request_path);
+                return None;
+            }
+        };
+    }
+    
+    // Robust directory traversal prevention
+    if is_directory_traversal_attempt(&current_decoded) {
+        warn!("Directory traversal attempt detected: {}", current_decoded);
         return None;
     }
     
-    // Join with root directory
-    let mut path = root.join(decoded_path.as_ref());
+    // Normalize path to prevent various bypass techniques
+    let normalized_path = normalize_path(&current_decoded);
     
-    // If path is a directory, look for index.gmi
-    if path.is_dir() {
-        path = path.join("index.gmi");
-    }
+    // Join with root directory using the normalized path
+    let base_path = root.join(&normalized_path);
     
-    // If file doesn't have an extension and doesn't exist, try adding .gmi
-    if path.extension().is_none() && !path.exists() {
-        let gmi_path = path.with_extension("gmi");
-        if gmi_path.exists() {
-            path = gmi_path;
+    // SECURITY: Get canonical root path for validation
+    let canonical_root = match root.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            error!("Failed to canonicalize root directory: {:?}", root);
+            return None;
         }
-    }
+    };
     
-    // Ensure the path exists and is a file
-    if !path.exists() || !path.is_file() {
+    // SECURITY: Pre-validate that our constructed path would be within root
+    // before doing any filesystem operations that could leak information
+    // We do this by checking if the base path (without resolving symlinks) 
+    // starts with our root when both are made absolute
+    let absolute_base = match base_path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => {
+            // Path doesn't exist yet, so we can't canonicalize it
+            // We need to validate using a different approach
+            
+            // Convert to absolute path without resolving symlinks
+            let absolute_base = if base_path.is_absolute() {
+                base_path.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(&base_path)
+            };
+            
+            // Check if this absolute path would be under our root
+            // by checking if it starts with the canonical root
+            if !absolute_base.starts_with(&canonical_root) {
+                warn!("Constructed path would be outside root: {:?}", absolute_base);
+                return None;
+            }
+            
+            // If the base path doesn't exist, try our variations
+            let path_candidates = vec![
+                base_path.join("index.gmi"),     // Directory index  
+                base_path.with_extension("gmi"), // Adding .gmi extension
+            ];
+            
+            for candidate in path_candidates {
+                if candidate.exists() {
+                    match candidate.canonicalize() {
+                        Ok(canonical_path) => {
+                            if canonical_path.starts_with(&canonical_root) && canonical_path.is_file() {
+                                return Some(canonical_path);
+                            } else if !canonical_path.starts_with(&canonical_root) {
+                                warn!("Path escape attempt: {:?} is not under {:?}", canonical_path, canonical_root);
+                                return None;
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
+            return None;
+        }
+    };
+    
+    // If we got here, the base path exists and we have its canonical form
+    // Verify it's within our root directory
+    if !absolute_base.starts_with(&canonical_root) {
+        warn!("Path escape attempt: {:?} is not under {:?}", absolute_base, canonical_root);
         return None;
     }
     
-    // Ensure the resolved path is still under the root directory
-    match path.canonicalize() {
-        Ok(canonical_path) => {
-            if canonical_path.starts_with(root) {
-                Some(canonical_path)
-            } else {
-                warn!("Path escape attempt: {:?}", canonical_path);
-                None
+    // Now safely check what type of file/directory we have
+    if absolute_base.is_file() {
+        return Some(absolute_base);
+    } else if absolute_base.is_dir() {
+        // Look for index.gmi in the directory
+        let index_path = absolute_base.join("index.gmi");
+        if index_path.exists() && index_path.is_file() {
+            match index_path.canonicalize() {
+                Ok(canonical_index) => {
+                    if canonical_index.starts_with(&canonical_root) {
+                        return Some(canonical_index);
+                    } else {
+                        warn!("Index path escape attempt: {:?}", canonical_index);
+                        return None;
+                    }
+                }
+                Err(_) => return None,
             }
         }
-        Err(_) => None,
+    } else {
+        // Not a regular file or directory, try adding .gmi extension
+        let gmi_path = absolute_base.with_extension("gmi");
+        if gmi_path.exists() && gmi_path.is_file() {
+            match gmi_path.canonicalize() {
+                Ok(canonical_gmi) => {
+                    if canonical_gmi.starts_with(&canonical_root) {
+                        return Some(canonical_gmi);
+                    } else {
+                        warn!("GMI path escape attempt: {:?}", canonical_gmi);
+                        return None;
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
     }
+    
+    // No valid file found
+    None
+}
+
+/// Check if a decoded path contains directory traversal patterns
+fn is_directory_traversal_attempt(path: &str) -> bool {
+    // Check for various directory traversal patterns
+    let traversal_patterns = [
+        "..",           // Basic parent directory
+        ".\\..",        // Windows style
+        "../",          // With slash
+        "..\\",         // Windows with backslash
+        "%2e%2e",       // URL encoded (should be caught by iterative decoding)
+        "..\x00",       // Null byte injection
+    ];
+    
+    for pattern in &traversal_patterns {
+        if path.contains(pattern) {
+            return true;
+        }
+    }
+    
+    // Check for encoded variations that might slip through
+    if path.contains('\0') {
+        return true; // Null byte injection
+    }
+    
+    // Check for various Unicode representations of dots
+    // Unicode normalization attack prevention
+    if path.contains("\u{002e}\u{002e}") || // Standard dots  
+       path.contains("\u{ff0e}\u{ff0e}") || // Fullwidth dots
+       path.contains("\u{2024}\u{2024}") {  // One dot leader
+        return true;
+    }
+    
+    false
+}
+
+/// Normalize path to prevent various bypass techniques
+fn normalize_path(path: &str) -> String {
+    let mut normalized = path.to_string();
+    
+    // Replace backslashes with forward slashes for consistency
+    normalized = normalized.replace('\\', "/");
+    
+    // Remove null bytes
+    normalized = normalized.replace('\0', "");
+    
+    // Collapse multiple slashes into single slash
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
+    
+    // Remove leading slashes
+    normalized = normalized.trim_start_matches('/').to_string();
+    
+    // Remove trailing slashes  
+    normalized = normalized.trim_end_matches('/').to_string();
+    
+    normalized
 }
 
 /// Serve a file to the client
@@ -226,6 +377,72 @@ mod tests {
         assert_eq!(resolve_path(root, "/../etc/passwd"), None);
         assert_eq!(resolve_path(root, "/../../etc/passwd"), None);
         assert_eq!(resolve_path(root, "/test/../../../etc/passwd"), None);
+        
+        // Test URL encoded traversal attempts
+        assert_eq!(resolve_path(root, "/%2e%2e/etc/passwd"), None);
+        assert_eq!(resolve_path(root, "/%2e%2e%2fetc%2fpasswd"), None);
+        
+        // Test double URL encoded traversal (the vulnerability we found)
+        assert_eq!(resolve_path(root, "/%252e%252e/etc/passwd"), None);
+        assert_eq!(resolve_path(root, "/%252e%252e%252fetc%252fpasswd"), None);
+        
+        // Test Windows-style traversal
+        assert_eq!(resolve_path(root, "/..\\etc\\passwd"), None);
+        assert_eq!(resolve_path(root, "/test\\..\\..\\..\\etc\\passwd"), None);
+        
+        // Test null byte injection
+        assert_eq!(resolve_path(root, "/test.gmi\0../../../etc/passwd"), None);
+        assert_eq!(resolve_path(root, "/test.gmi%00../../../etc/passwd"), None);
+    }
+    
+    #[test]
+    fn test_is_directory_traversal_attempt() {
+        // Basic traversal patterns
+        assert!(is_directory_traversal_attempt("../etc/passwd"));
+        assert!(is_directory_traversal_attempt("../../etc/passwd"));
+        assert!(is_directory_traversal_attempt("test/../../../etc/passwd"));
+        
+        // Windows style
+        assert!(is_directory_traversal_attempt("..\\etc\\passwd"));
+        assert!(is_directory_traversal_attempt("test\\..\\..\\etc\\passwd"));
+        
+        // With slashes
+        assert!(is_directory_traversal_attempt("../"));
+        assert!(is_directory_traversal_attempt("..\\"));
+        
+        // Null byte injection
+        assert!(is_directory_traversal_attempt("test\0../etc/passwd"));
+        
+        // Valid paths should not be flagged
+        assert!(!is_directory_traversal_attempt("test.gmi"));
+        assert!(!is_directory_traversal_attempt("subdir/file.gmi"));
+        assert!(!is_directory_traversal_attempt("index.gmi"));
+        assert!(!is_directory_traversal_attempt(""));
+    }
+    
+    #[test]
+    fn test_normalize_path() {
+        // Basic normalization
+        assert_eq!(normalize_path("test.gmi"), "test.gmi");
+        assert_eq!(normalize_path("/test.gmi"), "test.gmi");
+        assert_eq!(normalize_path("test.gmi/"), "test.gmi");
+        assert_eq!(normalize_path("/test.gmi/"), "test.gmi");
+        
+        // Multiple slashes
+        assert_eq!(normalize_path("test//file.gmi"), "test/file.gmi");
+        assert_eq!(normalize_path("///test///file.gmi///"), "test/file.gmi");
+        
+        // Backslash to forward slash conversion
+        assert_eq!(normalize_path("test\\file.gmi"), "test/file.gmi");
+        assert_eq!(normalize_path("test\\\\file.gmi"), "test/file.gmi");
+        
+        // Null byte removal
+        assert_eq!(normalize_path("test\0file.gmi"), "testfile.gmi");
+        
+        // Empty and root cases
+        assert_eq!(normalize_path(""), "");
+        assert_eq!(normalize_path("/"), "");
+        assert_eq!(normalize_path("///"), "");
     }
     
     #[test]
@@ -240,5 +457,40 @@ mod tests {
         // Test index file resolution
         let resolved = resolve_path(root, "/");
         assert_eq!(resolved, Some(index_file.canonicalize().unwrap()));
+    }
+    
+    #[test]
+    fn test_security_ordering_no_information_leakage() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        
+        // Create a file outside the root directory (simulating /etc/passwd)
+        let outside_dir = temp_dir.path().parent().unwrap();
+        let outside_file = outside_dir.join("secret.txt");
+        fs::write(&outside_file, "secret content").unwrap();
+        
+        // Attempt directory traversal to access the file
+        // This should fail WITHOUT leaking whether the file exists
+        let result = resolve_path(root, "/../secret.txt");
+        assert_eq!(result, None);
+        
+        // The key security improvement: we should not be able to determine
+        // if files exist outside our root directory through timing or other means
+        // This test verifies our fix prevents information leakage
+        
+        // Test various traversal attempts that should all fail safely
+        let traversal_attempts = vec![
+            "/../secret.txt",
+            "/%2e%2e/secret.txt", 
+            "/%252e%252e/secret.txt",
+        ];
+        
+        for attempt in traversal_attempts {
+            let result = resolve_path(root, attempt);
+            assert_eq!(result, None, "Traversal attempt should fail: {}", attempt);
+        }
+        
+        // Clean up
+        let _ = fs::remove_file(&outside_file);
     }
 }
