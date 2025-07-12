@@ -1,4 +1,4 @@
-use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, SanType};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::{Certificate as RustlsCertificate, PrivateKey, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::fs::File;
@@ -14,30 +14,24 @@ pub fn generate_self_signed_cert(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut params = CertificateParams::default();
+    let mut params = CertificateParams::new(vec![hostname.to_string()])?;
     
     // Set the subject name
     let mut distinguished_name = DistinguishedName::new();
     distinguished_name.push(DnType::CommonName, hostname);
     params.distinguished_name = distinguished_name;
     
-    // Add Subject Alternative Names
-    params.subject_alt_names = vec![
-        SanType::DnsName(hostname.to_string()),
-    ];
-    
-    // Generate the certificate
-    let cert = Certificate::from_params(params)?;
+    // Generate key pair and certificate
+    let key_pair = KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
     
     // Write certificate to file
-    let cert_pem = cert.serialize_pem()?;
     let mut cert_file = File::create(cert_path)?;
-    cert_file.write_all(cert_pem.as_bytes())?;
+    cert_file.write_all(cert.pem().as_bytes())?;
     
     // Write private key to file
-    let key_pem = cert.serialize_private_key_pem();
     let mut key_file = File::create(key_path)?;
-    key_file.write_all(key_pem.as_bytes())?;
+    key_file.write_all(key_pair.serialize_pem().as_bytes())?;
     
     Ok(())
 }
