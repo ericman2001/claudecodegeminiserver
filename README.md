@@ -23,8 +23,8 @@ A minimal Gemini Protocol server written in Rust. This server provides static fi
 ### Building from source
 
 ```bash
-git clone https://github.com/yourusername/gemini-server.git
-cd gemini-server
+git clone https://github.com/ericman2001/claudecodegeminiserver.git
+cd claudecodegeminiserver
 cargo build --release
 ```
 
@@ -114,11 +114,20 @@ my-capsule/
 
 ## Security Considerations
 
-- The server prevents directory traversal attacks by validating all paths
+- **Comprehensive directory traversal protection**: Prevents all known traversal techniques including:
+  - Basic traversal (`../../../etc/passwd`)
+  - URL encoded traversal (`%2e%2e/etc/passwd`)
+  - Double URL encoded traversal (`%252e%252e/etc/passwd`)
+  - Windows-style traversal (`..\..\..\etc\passwd`)
+  - Null byte injection (`file.gmi\0../../../etc/passwd`)
+  - Unicode normalization attacks
+- **Secure path validation ordering**: Validates path containment before filesystem operations to prevent information leakage
+- **Robust path normalization**: Handles mixed separators, multiple slashes, and various encoding schemes
 - Only regular files are served (no device files, sockets, etc.)
 - File size limit of 10MB per file
 - Request size limited to 1024 bytes per Gemini specification
 - TLS-only connections (no plaintext option)
+- Iterative URL decoding to prevent encoding bypass attacks
 
 ## Development
 
