@@ -7,7 +7,6 @@ use tokio::net::TcpListener;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
-use std::os::unix::fs::FileTypeExt;
 
 /// Run the Gemini server
 pub async fn run_server(
@@ -326,7 +325,7 @@ async fn serve_file(
             error!("Failed to open file {}: {}", path.display(), e);
             // The file might not be found if it was deleted after path resolution.
             // Treat as a temporary failure.
-            response::send_temporary_failure(stream, "File not accessible").await?;
+            response::send_not_found(stream).await?;
             return Ok(());
         }
     };
@@ -335,16 +334,16 @@ async fn serve_file(
         Ok(m) => m,
         Err(e) => {
             error!("Failed to get metadata for {}: {}", path.display(), e);
-            response::send_temporary_failure(stream, "Failed to read file metadata").await?;
+            response::send_not_found(stream).await?;
             return Ok(());
         }
     };
 
     // The resolved path should always be a file, but we check again on the handle
     // as a defense-in-depth measure against TOCTOU attacks.
-    if !metadata.is_file() || metadata.file_type().is_fifo() || metadata.file_type().is_socket() || metadata.file_type().is_block_device() || metadata.file_type().is_char_device() {
-        warn!("Path is not a valid regular file (may be FIFO, socket, or device): {}", path.display());
-        response::send_temporary_failure(stream, "Resource is not a valid file").await?;
+    if !metadata.is_file() {
+        warn!("Path is not a regular file: {}", path.display());
+        response::send_not_found(stream).await?;
         return Ok(());
     }
     
