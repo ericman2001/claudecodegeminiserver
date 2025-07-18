@@ -2,8 +2,7 @@ use crate::{mime, request::GeminiRequest, response, tls};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
@@ -317,8 +316,36 @@ async fn serve_file(
     stream: &mut TlsStream<tokio::net::TcpStream>,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Read file metadata
-    let metadata = fs::metadata(path).await?;
+    // TOCTOU Mitigation: Open the file first, then get metadata and read from the handle.
+    // This ensures that we are checking and reading the same file, preventing a race
+    // condition where the file could be swapped for a symlink after validation.
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to open file {}: {}", path.display(), e);
+            // The file might not be found if it was deleted after path resolution.
+            // Treat as a temporary failure.
+            response::send_temporary_failure(stream, "File not accessible").await?;
+            return Ok(());
+        }
+    };
+
+    let metadata = match file.metadata().await {
+        Ok(m) => m,
+        Err(e) => {
+            error!("Failed to get metadata for {}: {}", path.display(), e);
+            response::send_temporary_failure(stream, "Failed to read file metadata").await?;
+            return Ok(());
+        }
+    };
+
+    // The resolved path should always be a file, but we check again on the handle
+    // as a defense-in-depth measure against TOCTOU attacks.
+    if !metadata.is_file() {
+        warn!("Path is not a file, potential TOCTOU: {}", path.display());
+        response::send_temporary_failure(stream, "Resource is not a file").await?;
+        return Ok(());
+    }
     
     // Check file size (optional: add a maximum file size limit)
     const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
@@ -328,15 +355,13 @@ async fn serve_file(
         return Ok(());
     }
     
-    // Read file content
-    let content = match fs::read(path).await {
-        Ok(content) => content,
-        Err(e) => {
-            error!("Failed to read file {}: {}", path.display(), e);
-            response::send_temporary_failure(stream, "Failed to read file").await?;
-            return Ok(());
-        }
-    };
+    // Read file content from the handle
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    if let Err(e) = file.read_to_end(&mut content).await {
+        error!("Failed to read file content {}: {}", path.display(), e);
+        response::send_temporary_failure(stream, "Failed to read file").await?;
+        return Ok(());
+    }
     
     // Detect MIME type
     let mime_type = mime::get_mime_type(path);
