@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
+use std::os::unix::fs::FileTypeExt;
 
 /// Run the Gemini server
 pub async fn run_server(
@@ -341,9 +342,9 @@ async fn serve_file(
 
     // The resolved path should always be a file, but we check again on the handle
     // as a defense-in-depth measure against TOCTOU attacks.
-    if !metadata.is_file() {
-        warn!("Path is not a file, potential TOCTOU: {}", path.display());
-        response::send_temporary_failure(stream, "Resource is not a file").await?;
+    if !metadata.is_file() || metadata.file_type().is_fifo() || metadata.file_type().is_socket() || metadata.file_type().is_block_device() || metadata.file_type().is_char_device() {
+        warn!("Path is not a valid regular file (may be FIFO, socket, or device): {}", path.display());
+        response::send_temporary_failure(stream, "Resource is not a valid file").await?;
         return Ok(());
     }
     
