@@ -1,5 +1,5 @@
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::time::timeout;
 use tracing::{debug, warn};
 use url::Url;
@@ -18,22 +18,26 @@ impl GeminiRequest {
     pub async fn from_stream<R: AsyncRead + Unpin>(
         stream: R,
     ) -> Result<Self, RequestError> {
-        let mut reader = BufReader::new(stream);
+        let reader = BufReader::new(stream);
         let mut line = String::new();
-        
+
+        // Limit the reader to prevent OOM attacks
+        let mut limited_reader = reader.take(MAX_REQUEST_SIZE as u64 + 1);
+
         // Read request with timeout
-        match timeout(REQUEST_TIMEOUT, reader.read_line(&mut line)).await {
+        let bytes_read = match timeout(REQUEST_TIMEOUT, limited_reader.read_line(&mut line)).await {
             Ok(Ok(0)) => return Err(RequestError::EmptyRequest),
             Ok(Ok(bytes_read)) => {
                 debug!("Read {} bytes from request", bytes_read);
+                bytes_read
             }
             Ok(Err(e)) => return Err(RequestError::IoError(e)),
             Err(_) => return Err(RequestError::Timeout),
-        }
-        
-        // Check request size limit
-        if line.len() > MAX_REQUEST_SIZE {
-            warn!("Request exceeds size limit: {} bytes", line.len());
+        };
+
+        // Check if the request is too large. This is now safe because we limited the read.
+        if bytes_read > MAX_REQUEST_SIZE || !line.ends_with('\n') {
+            warn!("Request exceeds size limit or is malformed");
             return Err(RequestError::TooLarge);
         }
         

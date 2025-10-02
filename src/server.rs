@@ -122,9 +122,12 @@ fn resolve_path(root: &Path, request_path: &str) -> Option<PathBuf> {
     // Perform iterative URL decoding to handle double/triple encoding
     let mut previous_decoded = String::new();
     let mut current_decoded = decoded_path.to_string();
-    
-    // Keep decoding until no more changes occur (prevents double encoding bypass)
-    while previous_decoded != current_decoded {
+    const MAX_DECODE_ITERATIONS: usize = 10;
+
+    for _ in 0..MAX_DECODE_ITERATIONS {
+        if previous_decoded == current_decoded {
+            break;
+        }
         previous_decoded = current_decoded.clone();
         current_decoded = match urlencoding::decode(&current_decoded) {
             Ok(decoded) => decoded.into_owned(),
@@ -133,6 +136,11 @@ fn resolve_path(root: &Path, request_path: &str) -> Option<PathBuf> {
                 return None;
             }
         };
+    }
+
+    if previous_decoded != current_decoded {
+        warn!("Path decoding reached iteration limit, potential DoS attack");
+        return None;
     }
     
     // Robust directory traversal prevention
@@ -298,8 +306,18 @@ fn normalize_path(path: &str) -> String {
     normalized = normalized.replace('\0', "");
     
     // Collapse multiple slashes into single slash
-    while normalized.contains("//") {
+    const MAX_NORMALIZE_ITERATIONS: usize = 10;
+    for _ in 0..MAX_NORMALIZE_ITERATIONS {
+        if !normalized.contains("//") {
+            break;
+        }
         normalized = normalized.replace("//", "/");
+    }
+
+    if normalized.contains("//") {
+        warn!("Path normalization reached iteration limit, potential DoS attack");
+        // Return a value that will cause the path resolution to fail
+        return "/.".to_string(); 
     }
     
     // Remove leading slashes
