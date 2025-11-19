@@ -1,7 +1,6 @@
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::{error, info};
-use tracing_subscriber;
 
 mod mime;
 mod request;
@@ -48,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     let log_level = args.log_level.parse::<tracing::Level>()
         .unwrap_or(tracing::Level::INFO);
-    tracing_subscriber::fmt()
+    tracing_subscriber::fmt::fmt()
         .with_max_level(log_level)
         .init();
 
@@ -66,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 error!("Failed to generate certificate: {}", e);
-                return Err(e.into());
+                return Err(e);
             }
         }
     }
