@@ -88,11 +88,10 @@ impl Response {
         self.write_header(stream).await?;
 
         // Write body if present (only for success responses)
-        if self.status == StatusCode::Success {
-            if let Some(body) = &self.body {
+        if self.status == StatusCode::Success
+            && let Some(body) = &self.body {
                 stream.write_all(body).await?;
             }
-        }
 
         // Flush to ensure all data is sent
         stream.flush().await?;
