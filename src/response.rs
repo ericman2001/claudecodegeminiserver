@@ -40,7 +40,7 @@ impl Response {
         let meta = meta.into();
         // Sanitize meta to prevent header injection
         // Remove CR and LF characters
-        let sanitized_meta = meta.replace('\r', "").replace('\n', "");
+        let sanitized_meta = meta.replace(['\r', '\n'], "");
 
         Self {
             status,
@@ -51,9 +51,13 @@ impl Response {
 
     /// Create a success response with content
     pub fn success(mime_type: impl Into<String>, body: Vec<u8>) -> Self {
+        let meta = mime_type.into();
+        // Sanitize meta to prevent header injection
+        let sanitized_meta = meta.replace(['\r', '\n'], "");
+        
         Self {
             status: StatusCode::Success,
-            meta: mime_type.into(),
+            meta: sanitized_meta,
             body: Some(body),
         }
     }
@@ -84,8 +88,8 @@ impl Response {
         self.write_header(stream).await?;
 
         // Write body if present (only for success responses)
-        if let Some(body) = &self.body {
-            if self.status == StatusCode::Success {
+        if self.status == StatusCode::Success {
+            if let Some(body) = &self.body {
                 stream.write_all(body).await?;
             }
         }

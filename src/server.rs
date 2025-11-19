@@ -414,7 +414,9 @@ async fn serve_file(
     let mime_type = mime::get_mime_type(path);
     debug!("Serving {} with MIME type: {}", path.display(), mime_type);
 
-    // Send response header
+    // Send response header with sanitized MIME type
+    // Note: mime::get_mime_type returns static strings, but we use Response::success
+    // which will construct a Response that sanitizes the meta field through Response::new
     let response = response::Response::success(mime_type, vec![]);
     response.write_header(stream).await?;
 
