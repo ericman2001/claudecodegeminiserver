@@ -15,7 +15,7 @@ impl StatusCode {
     pub fn code(&self) -> u8 {
         *self as u8
     }
-    
+
     /// Get default meta text for status codes that don't require specific meta
     pub fn default_meta(&self) -> &'static str {
         match self {
@@ -37,39 +37,70 @@ pub struct Response {
 impl Response {
     /// Create a new response with status and meta
     pub fn new(status: StatusCode, meta: impl Into<String>) -> Self {
+        let meta = meta.into();
+        // Sanitize meta to prevent header injection
+        // Remove CR and LF characters
+        let sanitized_meta = meta.replace(['\r', '\n'], "");
+
         Self {
             status,
-            meta: meta.into(),
+            meta: sanitized_meta,
             body: None,
         }
     }
-    
+
     /// Create a success response with content
     pub fn success(mime_type: impl Into<String>, body: Vec<u8>) -> Self {
+        let meta = mime_type.into();
+        // Sanitize meta to prevent header injection
+        let sanitized_meta = meta.replace(['\r', '\n'], "");
+        
         Self {
             status: StatusCode::Success,
-            meta: mime_type.into(),
+            meta: sanitized_meta,
             body: Some(body),
         }
     }
-    
+
     /// Create a not found response
     pub fn not_found() -> Self {
         Self::new(StatusCode::NotFound, StatusCode::NotFound.default_meta())
     }
-    
+
     /// Create a bad request response
     pub fn bad_request() -> Self {
-        Self::new(StatusCode::BadRequest, StatusCode::BadRequest.default_meta())
+        Self::new(
+            StatusCode::BadRequest,
+            StatusCode::BadRequest.default_meta(),
+        )
     }
-    
+
     /// Create a temporary failure response
     pub fn temporary_failure(reason: impl Into<String>) -> Self {
         Self::new(StatusCode::TemporaryFailure, reason)
     }
-    
+
     /// Write the response to the stream
     pub async fn write_to<W: AsyncWrite + Unpin>(
+        &self,
+        stream: &mut W,
+    ) -> Result<(), std::io::Error> {
+        self.write_header(stream).await?;
+
+        // Write body if present (only for success responses)
+        if self.status == StatusCode::Success
+            && let Some(body) = &self.body {
+                stream.write_all(body).await?;
+            }
+
+        // Flush to ensure all data is sent
+        stream.flush().await?;
+
+        Ok(())
+    }
+
+    /// Write only the response header to the stream
+    pub async fn write_header<W: AsyncWrite + Unpin>(
         &self,
         stream: &mut W,
     ) -> Result<(), std::io::Error> {
@@ -77,43 +108,18 @@ impl Response {
         let header = format!("{} {}\r\n", self.status.code(), self.meta);
         debug!("Sending response: {}", header.trim());
         stream.write_all(header.as_bytes()).await?;
-        
-        // Write body if present (only for success responses)
-        if let Some(body) = &self.body {
-            if self.status == StatusCode::Success {
-                stream.write_all(body).await?;
-            }
-        }
-        
-        // Flush to ensure all data is sent
-        stream.flush().await?;
-        
         Ok(())
     }
 }
 
-/// Helper function to send a success response with file content
-pub async fn send_file<W: AsyncWrite + Unpin>(
-    stream: &mut W,
-    mime_type: &str,
-    content: Vec<u8>,
-) -> Result<(), std::io::Error> {
-    let response = Response::success(mime_type, content);
-    response.write_to(stream).await
-}
-
 /// Helper function to send a not found response
-pub async fn send_not_found<W: AsyncWrite + Unpin>(
-    stream: &mut W,
-) -> Result<(), std::io::Error> {
+pub async fn send_not_found<W: AsyncWrite + Unpin>(stream: &mut W) -> Result<(), std::io::Error> {
     let response = Response::not_found();
     response.write_to(stream).await
 }
 
 /// Helper function to send a bad request response
-pub async fn send_bad_request<W: AsyncWrite + Unpin>(
-    stream: &mut W,
-) -> Result<(), std::io::Error> {
+pub async fn send_bad_request<W: AsyncWrite + Unpin>(stream: &mut W) -> Result<(), std::io::Error> {
     let response = Response::bad_request();
     response.write_to(stream).await
 }
@@ -130,24 +136,34 @@ pub async fn send_temporary_failure<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_success_response() {
         let mut buffer = Vec::new();
         let response = Response::success("text/plain", b"Hello, world!".to_vec());
         response.write_to(&mut buffer).await.unwrap();
-        
+
         let result = String::from_utf8(buffer).unwrap();
         assert_eq!(result, "20 text/plain\r\nHello, world!");
     }
-    
+
     #[tokio::test]
     async fn test_not_found_response() {
         let mut buffer = Vec::new();
         let response = Response::not_found();
         response.write_to(&mut buffer).await.unwrap();
-        
+
         let result = String::from_utf8(buffer).unwrap();
         assert_eq!(result, "51 Not found\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_header_sanitization() {
+        let response = Response::new(StatusCode::TemporaryFailure, "Error\r\nInjection");
+        let mut buffer = Vec::new();
+        response.write_header(&mut buffer).await.unwrap();
+
+        let result = String::from_utf8(buffer).unwrap();
+        assert_eq!(result, "40 ErrorInjection\r\n");
     }
 }
