@@ -9,7 +9,7 @@ A minimal Gemini Protocol server written in Rust. This server provides static fi
 - **Proper MIME type detection** for common file formats
 - **Security features** including path traversal prevention
 - **Request validation** with 1024 byte limit
-- **Standard Gemini status codes** (20, 40, 51, 59)
+- **Standard Gemini status codes** (20, 40, 51, 53, 59)
 - **Automatic index.gmi serving** for directories
 - **Configurable logging levels**
 
@@ -17,7 +17,9 @@ A minimal Gemini Protocol server written in Rust. This server provides static fi
 
 ### Prerequisites
 
-- Rust 1.70 or later
+- Rust 1.88 or later. The crate uses `edition = "2024"` (requires Rust 1.85+)
+  and let-chains in `src/response.rs` (stabilized in Rust 1.88), so 1.88 is the
+  actual minimum supported toolchain.
 - OpenSSL development libraries (for certificate generation)
 
 ### Building from source
@@ -58,13 +60,34 @@ gemini-server [OPTIONS]
 OPTIONS:
     -r, --root <ROOT>              Root directory to serve files from [default: .]
     -p, --port <PORT>              Port to listen on [default: 1965]
+        --host <HOST>             Address to bind the server to [default: 0.0.0.0]
         --cert <CERT>              TLS certificate file [default: cert.pem]
         --key <KEY>                TLS key file [default: key.pem]
         --generate-cert            Generate self-signed certificate and exit
-        --hostname <HOSTNAME>      Hostname for the server [default: localhost]
+        --hostname <HOSTNAME>      Hostname the server answers for; may be given
+                                   multiple times [default: localhost]
         --log-level <LOG_LEVEL>    Log level (error, warn, info, debug, trace) [default: info]
     -h, --help                     Print help
     -V, --version                  Print version
+```
+
+#### Bind address and hostnames
+
+- `--host` controls the local address the listener binds to (e.g. `127.0.0.1`
+  to only accept local connections). It defaults to `0.0.0.0` (all interfaces).
+- `--hostname` may be specified multiple times to serve several virtual
+  hostnames, e.g. `--hostname a.example --hostname b.example`. When generating a
+  self-signed certificate, every hostname is added as a Subject Alternative Name
+  (the first is also used as the certificate CommonName).
+- Per the Gemini specification, requests whose hostname is not one of the served
+  `--hostname` values, or whose port does not match the served port, are refused
+  with status **53 (proxy request refused)**. A request URL that omits the port
+  is treated as the default Gemini port **1965**.
+
+Serve multiple hostnames:
+```bash
+gemini-server --generate-cert --hostname a.example --hostname b.example
+gemini-server --host 127.0.0.1 --hostname a.example --hostname b.example
 ```
 
 ### Examples
@@ -128,6 +151,19 @@ my-capsule/
 - Request size limited to 1024 bytes per Gemini specification
 - TLS-only connections (no plaintext option)
 - Iterative URL decoding to prevent encoding bypass attacks
+- **Sensitive files inside the root are never served**: any request for a
+  dotfile (a path component starting with `.`) or for the configured TLS
+  certificate/key file is refused with status 51 (not found), even if those
+  files live inside the served root.
+- **Hostname/port enforcement**: requests for non-served hostnames or mismatched
+  ports are refused with status 53 (proxy request refused).
+- **Connection timeouts**: the TLS handshake and the overall connection are
+  time-bounded so slow clients cannot hold connection slots indefinitely.
+
+> **Important:** Do not place the TLS key or certificate inside the served root
+> directory. While the server explicitly refuses to serve the configured
+> cert/key and any dotfiles, keeping secrets outside the served root is the
+> safest configuration.
 
 ## Development
 

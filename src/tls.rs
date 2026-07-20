@@ -8,17 +8,24 @@ use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info};
 
-/// Generate a self-signed certificate for the given hostname
+/// Generate a self-signed certificate for the given hostnames.
+///
+/// All hostnames are added as Subject Alternative Names; the first is also
+/// used as the certificate's CommonName.
 pub fn generate_self_signed_cert(
-    hostname: &str,
+    hostnames: &[String],
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut params = CertificateParams::new(vec![hostname.to_string()])?;
+    if hostnames.is_empty() {
+        return Err("At least one hostname is required to generate a certificate".into());
+    }
 
-    // Set the subject name
+    let mut params = CertificateParams::new(hostnames.to_vec())?;
+
+    // Set the subject name using the first hostname as CommonName
     let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::CommonName, hostname);
+    distinguished_name.push(DnType::CommonName, hostnames[0].as_str());
     params.distinguished_name = distinguished_name;
 
     // Generate key pair and certificate

@@ -7,6 +7,7 @@ pub enum StatusCode {
     Success = 20,
     TemporaryFailure = 40,
     NotFound = 51,
+    ProxyRequestRefused = 53,
     BadRequest = 59,
 }
 
@@ -22,6 +23,7 @@ impl StatusCode {
             StatusCode::Success => "text/gemini; charset=utf-8",
             StatusCode::TemporaryFailure => "Temporary failure",
             StatusCode::NotFound => "Not found",
+            StatusCode::ProxyRequestRefused => "Proxy request refused",
             StatusCode::BadRequest => "Bad request",
         }
     }
@@ -65,6 +67,14 @@ impl Response {
     /// Create a not found response
     pub fn not_found() -> Self {
         Self::new(StatusCode::NotFound, StatusCode::NotFound.default_meta())
+    }
+
+    /// Create a proxy request refused response
+    pub fn proxy_request_refused() -> Self {
+        Self::new(
+            StatusCode::ProxyRequestRefused,
+            StatusCode::ProxyRequestRefused.default_meta(),
+        )
     }
 
     /// Create a bad request response
@@ -124,6 +134,14 @@ pub async fn send_bad_request<W: AsyncWrite + Unpin>(stream: &mut W) -> Result<(
     response.write_to(stream).await
 }
 
+/// Helper function to send a proxy request refused response
+pub async fn send_proxy_request_refused<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+) -> Result<(), std::io::Error> {
+    let response = Response::proxy_request_refused();
+    response.write_to(stream).await
+}
+
 /// Helper function to send a temporary failure response
 pub async fn send_temporary_failure<W: AsyncWrite + Unpin>(
     stream: &mut W,
@@ -155,6 +173,16 @@ mod tests {
 
         let result = String::from_utf8(buffer).unwrap();
         assert_eq!(result, "51 Not found\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_proxy_request_refused_response() {
+        let mut buffer = Vec::new();
+        let response = Response::proxy_request_refused();
+        response.write_to(&mut buffer).await.unwrap();
+
+        let result = String::from_utf8(buffer).unwrap();
+        assert_eq!(result, "53 Proxy request refused\r\n");
     }
 
     #[tokio::test]

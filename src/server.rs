@@ -1,16 +1,25 @@
 use crate::{mime, request::GeminiRequest, response, tls};
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, error, info, warn};
 
+/// Maximum time allowed for the TLS handshake to complete before the
+/// connection is dropped (slowloris mitigation).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum time allowed for the whole connection (handshake, request read,
+/// and response write) so a slow client cannot hold a permit indefinitely.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Run the Gemini server
 pub async fn run_server(
-    hostname: String,
+    hostnames: Vec<String>,
+    host: String,
     port: u16,
     cert_path: PathBuf,
     key_path: PathBuf,
@@ -27,13 +36,26 @@ pub async fn run_server(
     // Load TLS acceptor
     let acceptor = tls::load_tls_acceptor(&cert_path, &key_path)?;
 
-    // Bind to address
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Server listening on {}", addr);
+    // Canonicalize the cert and key paths so we can refuse to serve them even
+    // if they live inside the served root.
+    let mut forbidden_files: Vec<PathBuf> = Vec::new();
+    if let Ok(canonical_cert) = cert_path.canonicalize() {
+        forbidden_files.push(canonical_cert);
+    }
+    if let Ok(canonical_key) = key_path.canonicalize() {
+        forbidden_files.push(canonical_key);
+    }
+    let forbidden_files = Arc::new(forbidden_files);
+
+    // Bind to the configured address. `host` may be a DNS name rather than an
+    // IP, so bind via (host, port) directly instead of parsing a SocketAddr.
+    let listener = TcpListener::bind((host.as_str(), port)).await?;
+    let local_addr = listener.local_addr()?;
+    // The port we advertise/enforce must be the port we actually bound.
+    info!("Server listening on {}", local_addr);
 
     // Share server state
-    let hostname = Arc::new(hostname);
+    let hostnames = Arc::new(hostnames);
     let root_dir = Arc::new(root_dir);
 
     // Limit concurrent connections to prevent DoS
@@ -57,16 +79,33 @@ pub async fn run_server(
                 debug!("New connection from {}", peer_addr);
 
                 let acceptor = acceptor.clone();
-                let hostname = hostname.clone();
+                let hostnames = hostnames.clone();
                 let root_dir = root_dir.clone();
+                let forbidden_files = forbidden_files.clone();
 
                 // Handle connection in a separate task
                 tokio::spawn(async move {
                     // The permit is moved into the task and will be dropped when the task finishes
                     let _permit = permit;
 
-                    if let Err(e) = handle_connection(stream, acceptor, hostname, root_dir).await {
-                        error!("Connection error from {}: {}", peer_addr, e);
+                    // Cap the entire connection lifetime so slow response
+                    // reads/writes cannot hold a permit indefinitely.
+                    match tokio::time::timeout(
+                        CONNECTION_TIMEOUT,
+                        handle_connection(
+                            stream,
+                            acceptor,
+                            hostnames,
+                            port,
+                            root_dir,
+                            forbidden_files,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => error!("Connection error from {}: {}", peer_addr, e),
+                        Err(_) => warn!("Connection from {} timed out", peer_addr),
                     }
                 });
             }
@@ -84,15 +123,23 @@ pub async fn run_server(
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     acceptor: TlsAcceptor,
-    hostname: Arc<String>,
+    hostnames: Arc<Vec<String>>,
+    served_port: u16,
     root_dir: Arc<PathBuf>,
+    forbidden_files: Arc<Vec<PathBuf>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Perform TLS handshake
-    let mut tls_stream = match acceptor.accept(stream).await {
-        Ok(stream) => stream,
-        Err(e) => {
+    // Perform TLS handshake with a timeout so a stalled handshake cannot hold
+    // a semaphore permit indefinitely (slowloris mitigation).
+    let mut tls_stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
             warn!("TLS handshake failed: {}", e);
             return Err(e.into());
+        }
+        Err(_) => {
+            warn!("TLS handshake timed out");
+            return Ok(());
         }
     };
 
@@ -110,17 +157,29 @@ async fn handle_connection(
 
     info!("Request: {} {}", request.url.as_str(), request.path);
 
-    // Check hostname matches (optional, but good practice)
-    if !request.matches_hostname(&hostname) {
-        debug!(
-            "Hostname mismatch: expected {}, got {:?}",
-            hostname,
-            request.hostname()
-        );
+    // Reject requests whose authority (hostname/port) we do not serve, per the
+    // Gemini spec, with status 53 (proxy request refused).
+    if !request.matches_authority(&hostnames, served_port) {
+        if !request.matches_hostname(&hostnames) {
+            warn!(
+                "Rejecting request: hostname {:?} is not served (served: {:?})",
+                request.hostname(),
+                hostnames.as_ref()
+            );
+        } else {
+            warn!(
+                "Rejecting request: port {} does not match served port {}",
+                request.port(),
+                served_port
+            );
+        }
+        response::send_proxy_request_refused(&mut tls_stream).await?;
+        tls_stream.shutdown().await?;
+        return Ok(());
     }
 
     // Resolve file path
-    match resolve_path(&root_dir, &request.path) {
+    match resolve_path_checked(&root_dir, &request.path, &forbidden_files) {
         Some(file_path) => {
             // Serve the file
             serve_file(&mut tls_stream, &file_path).await?;
@@ -294,6 +353,55 @@ fn resolve_path(root: &Path, request_path: &str) -> Option<PathBuf> {
 
     // No valid file found
     None
+}
+
+/// Resolve a request path and then reject sensitive files inside the root.
+///
+/// This wraps `resolve_path` (whose directory-traversal defenses are left
+/// untouched) and additionally refuses dotfiles and the configured cert/key
+/// files, returning `None` (which callers translate to a 51 not-found).
+fn resolve_path_checked(
+    root: &Path,
+    request_path: &str,
+    forbidden_files: &[PathBuf],
+) -> Option<PathBuf> {
+    let resolved = resolve_path(root, request_path)?;
+    let canonical_root = root.canonicalize().ok()?;
+    if is_refused_file(&resolved, &canonical_root, forbidden_files) {
+        debug!("Refusing to serve sensitive file: {:?}", resolved);
+        return None;
+    }
+    Some(resolved)
+}
+
+/// Determine whether a canonical, in-root file should be refused.
+///
+/// A file is refused if any of its path components below the root begin with
+/// a `.` (dotfiles) or if its canonical path equals one of `forbidden_files`
+/// (the configured cert/key).
+fn is_refused_file(
+    canonical_path: &Path,
+    canonical_root: &Path,
+    forbidden_files: &[PathBuf],
+) -> bool {
+    // Refuse the configured cert/key files.
+    if forbidden_files.iter().any(|f| f == canonical_path) {
+        return true;
+    }
+
+    // Refuse dotfiles: inspect only the components below the root so a root
+    // that itself lives under a dot-directory is not incorrectly refused.
+    if let Ok(relative) = canonical_path.strip_prefix(canonical_root) {
+        for component in relative.components() {
+            if let Component::Normal(name) = component
+                && name.to_string_lossy().starts_with('.')
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Check if a decoded path contains directory traversal patterns
@@ -575,5 +683,65 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_file(&outside_file);
+    }
+
+    #[test]
+    fn test_refuse_cert_and_key_and_dotfiles() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Place cert, key, a dotfile, and a normal file inside the root.
+        let cert_file = root.join("cert.pem");
+        let key_file = root.join("key.pem");
+        let hidden_file = root.join(".hidden");
+        let normal_file = root.join("index.gmi");
+        fs::write(&cert_file, "cert").unwrap();
+        fs::write(&key_file, "key").unwrap();
+        fs::write(&hidden_file, "secret").unwrap();
+        fs::write(&normal_file, "hello").unwrap();
+
+        let forbidden = vec![
+            cert_file.canonicalize().unwrap(),
+            key_file.canonicalize().unwrap(),
+        ];
+
+        // The cert, key, and dotfile must all be refused.
+        assert_eq!(resolve_path_checked(root, "/cert.pem", &forbidden), None);
+        assert_eq!(resolve_path_checked(root, "/key.pem", &forbidden), None);
+        assert_eq!(resolve_path_checked(root, "/.hidden", &forbidden), None);
+
+        // A normal file is still served.
+        assert_eq!(
+            resolve_path_checked(root, "/index.gmi", &forbidden),
+            Some(normal_file.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_refuse_dotfile_in_subdirectory() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        let hidden = sub.join(".env");
+        fs::write(&hidden, "SECRET=1").unwrap();
+
+        assert_eq!(resolve_path_checked(root, "/sub/.env", &[]), None);
+    }
+
+    #[test]
+    fn test_is_refused_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().canonicalize().unwrap();
+
+        let normal = root.join("page.gmi");
+        let dotfile = root.join(".secret");
+        let cert = root.join("cert.pem");
+        let forbidden = vec![cert.clone()];
+
+        assert!(!is_refused_file(&normal, &root, &forbidden));
+        assert!(is_refused_file(&dotfile, &root, &forbidden));
+        assert!(is_refused_file(&cert, &root, &forbidden));
     }
 }
