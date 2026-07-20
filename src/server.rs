@@ -96,7 +96,7 @@ pub async fn run_server(
                             stream,
                             acceptor,
                             hostnames,
-                            port,
+                            local_addr.port(),
                             root_dir,
                             forbidden_files,
                         ),
