@@ -19,6 +19,10 @@ struct Args {
     #[arg(short, long, default_value = "1965")]
     port: u16,
 
+    /// Address to bind the server to
+    #[arg(long, default_value = "0.0.0.0")]
+    host: String,
+
     /// TLS certificate file
     #[arg(long, default_value = "cert.pem")]
     cert: PathBuf,
@@ -31,9 +35,10 @@ struct Args {
     #[arg(long)]
     generate_cert: bool,
 
-    /// Hostname for the server
-    #[arg(long, default_value = "localhost")]
-    hostname: String,
+    /// Hostname(s) the server answers for. May be specified multiple times.
+    /// Defaults to "localhost" when none are provided.
+    #[arg(long = "hostname")]
+    hostnames: Vec<String>,
 
     /// Log level (error, warn, info, debug, trace)
     #[arg(long, default_value = "info")]
@@ -42,7 +47,13 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // clap's `default_value` does not work cleanly with `Vec`, so default an
+    // empty hostnames vec to ["localhost"] here.
+    if args.hostnames.is_empty() {
+        args.hostnames = vec!["localhost".to_string()];
+    }
 
     // Initialize logging
     let log_level = args.log_level.parse::<tracing::Level>()
@@ -55,8 +66,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle certificate generation
     if args.generate_cert {
-        info!("Generating self-signed certificate for hostname: {}", args.hostname);
-        match tls::generate_self_signed_cert(&args.hostname, &args.cert, &args.key) {
+        info!(
+            "Generating self-signed certificate for hostnames: {}",
+            args.hostnames.join(", ")
+        );
+        match tls::generate_self_signed_cert(&args.hostnames, &args.cert, &args.key) {
             Ok(_) => {
                 info!("Certificate generated successfully!");
                 info!("Certificate written to: {}", args.cert.display());
@@ -86,10 +100,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Serving files from: {}", root.display());
 
     // Start the server
-    info!("Starting server on {}:{}", args.hostname, args.port);
-    
+    info!(
+        "Starting server on {}:{} (hostnames: {})",
+        args.host,
+        args.port,
+        args.hostnames.join(", ")
+    );
+
     match server::run_server(
-        args.hostname,
+        args.hostnames,
+        args.host,
         args.port,
         args.cert,
         args.key,

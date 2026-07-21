@@ -1,24 +1,32 @@
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::ServerConfig;
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info};
 
-/// Generate a self-signed certificate for the given hostname
+/// Generate a self-signed certificate for the given hostnames.
+///
+/// All hostnames are added as Subject Alternative Names; the first is also
+/// used as the certificate's CommonName.
 pub fn generate_self_signed_cert(
-    hostname: &str,
+    hostnames: &[String],
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut params = CertificateParams::new(vec![hostname.to_string()])?;
+    if hostnames.is_empty() {
+        return Err("At least one hostname is required to generate a certificate".into());
+    }
 
-    // Set the subject name
+    let mut params = CertificateParams::new(hostnames.to_vec())?;
+
+    // Set the subject name using the first hostname as CommonName
     let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::CommonName, hostname);
+    distinguished_name.push(DnType::CommonName, hostnames[0].as_str());
     params.distinguished_name = distinguished_name;
 
     // Generate key pair and certificate
@@ -41,28 +49,16 @@ pub fn load_tls_acceptor(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
-    // Load certificate
-    let cert_file = File::open(cert_path)?;
-    let mut cert_reader = BufReader::new(cert_file);
-
-    // rustls-pemfile 2.0 returns an iterator of Results
+    // Load certificate chain from PEM using rustls-pki-types' own PEM reader.
     let cert_chain: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+        CertificateDer::pem_file_iter(cert_path)?.collect::<Result<Vec<_>, _>>()?;
 
     if cert_chain.is_empty() {
         return Err("No certificates found in file".into());
     }
 
-    // Load private key
-    let key_file = File::open(key_path)?;
-    let mut key_reader = BufReader::new(key_file);
-
-    // rustls-pemfile 2.0 returns an iterator of Results for keys too, but we need to find the first private key
-    let private_key =
-        rustls_pemfile::private_key(&mut key_reader)?.ok_or("No private keys found in file")?;
-
-    // Convert to PrivateKeyDer (rustls-pemfile returns PrivateKeyDer directly now)
-    let key: PrivateKeyDer<'static> = private_key;
+    // Load the first private key from the PEM file.
+    let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_file(key_path)?;
 
     // Build server config
     // rustls 0.23: with_safe_defaults() is removed, defaults are safer by default
